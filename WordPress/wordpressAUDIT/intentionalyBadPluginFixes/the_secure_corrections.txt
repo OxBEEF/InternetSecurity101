@@ -1,0 +1,86 @@
+If you have not reviewed the intentionally vulnerable plugin, then I suggest you do so before reading on.
+
+The intentionally vulnerable plugin demonstrates a range of security vulnerabilities that are commonly seen in WordPress plugins. In this post I aim to go through each vulnerability giving a little background on why it is dangerous and how it should be fixed.
+
+SQL injection
+
+This is a rather famous vulnerability that can be exploited by an attacker to modify database queries. This can allow the attacker to read sensitive information from the database, modify data stored in the database, and possibly even execute commands on database server, among other things. The basic idea is that if untrusted user input is included directly in a query then maliciously formatted input can be used to alter the query’s syntax.
+
+The first SQL injection vulnerability is caused by the incorrect usage of the wpdb::prepare() method on line 42:
+
+1
+$wpdb->query( $wpdb->prepare( "INSERT INTO login_audit (login, pass, ip, time) VALUES ('$login', '$pass', '$ip', '$time')" ) );
+
+When using the prepare() method placeholders, such as %s and %d, should be used in the query string which is the first argument of the method — the method is not magic, it cannot parse the query to determine what was user input! The variables are then passed in as separate arguments so that they can be escaped properly before being included in the query. This rather common error has been made more obvious since the release of WordPress 3.5 which required more than one argument to be passed to the method.
+
+The correct usage, and the fix, is:
+
+1
+$wpdb->query( $wpdb->prepare( "INSERT INTO login_audit (login, pass, ip, time) VALUES (%s, %s, %s, %s)", $login, $pass, $ip, $time ) );
+
+The other two SQL injection vulnerabilities, on lines 102 and 127, are caused by incorrectly escaping user input that is not used in a quoted context of an SQL query. The esc_sql() function can only be safely used to escape input that will be used within quotes. However, the two queries are using input as a numeric argument that is not enclosed within quotes:
+
+1
+2
+3
+$log = $wpdb->get_row( "SELECT * FROM login_audit WHERE ID = " . esc_sql( $id ), ARRAY_A );
+// ... and ...
+
+$wpdb->query( "DELETE FROM login_audit WHERE ID = " . esc_sql( $_POST['id'] ) );
+To fix this you should use the prepare() method with a %d placeholder:
+
+1
+2
+3
+$log = $wpdb->
+get_row( $wpdb->prepare( "SELECT * FROM login_audit WHERE ID = %d", $id ), ARRAY_A );
+// ... and ...
+$wpdb->query( $wpdb->prepare( "DELETE FROM login_audit WHERE ID = %d", $_POST['id'] ) );
+It is also possible to sanitize numeric input by casting to int or using the absint() method.
+
+Cross-site scripting
+
+Cross-site scripting (XSS) is one of the most prevalent security vulnerabilities in web applications. XSS is also commonly found in WordPress plugins, so it features heavily in the intentionally vulnerable plugin. XSS is often classed as either “persistent” or “reflected”. An XSS vulnerability is persistent if the unsafe user input is stored in the database, and then output to other users in future requests. It is known as reflected if the unsafe user input is output immediately in response to a request containing the dangerous input. To exploit a reflected XSS vulnerability the attacker would have to convince a victim to click on their specially crafted link that triggers a malicious script. However, a persistent XSS vulnerability will allow the attacker to input their malicious script themselves and then wait for unsuspecting users to visit or click on benign looking links.
+
+There are two instances of persistent XSS in the intentionally vulnerable plugin, in dvp_view_all_logs() and dvp_view_log(). Both of these functions output data straight from the database without escaping it. All of this data originated from the user in dvp_log_failed_login(). For example, an attacker could purposefully fail a login attempt using a password of <script>alert(1)</script>. The fix for this would be to use an appropriate escaping function, such as esc_html() or esc_attr() when outputting data from the database. Data can also be sanitized when being stored in the database using KSES, or strip_tags() when no HTML is expected, in addition to escaping on output.
+
+There are also multiple examples of reflected XSS. On lines 104 and 115, the $id variable, which was originally $_GET['id'], is output without any escaping. Line 104 should be fixed with esc_html(), and line 115 should be fixed with esc_attr(). Another problem is the use of $_SERVER['PHP_SELF'] on line 116 to get the current URL. This is an extremely common problem that allows XSS since an attacker can control its value and include malicious HTML that will break out of the attribute and execute a script. This should be fixed by using a WordPress function, such as menu_page_url(), to get the correct URL.
+
+Cross-site request forgery
+
+Another extremely common vulnerability in web applications is the failure to prevent cross-site request forgeries (CSRF). This type of attack exploits a request handler that checks authorisation, but not intention. A malicious website is able to send a request to another site that the user is authenticated to. The vulnerable target site will accept this request since it is sent with valid authentication cookies. However, the user did not intend for the action to be performed. WordPress plugins can defend against this type of attack by using nonces. These are action dependent random strings that cannot be predicted by an attacker, but can be verified by WordPress. So, if a request does not include a valid nonce then it is rejected.
+
+The intentionally vulnerable plugin looks as if it makes use of nonces to defend against CSRF, but the author has made a couple of mistakes that leave it exploitable. Firstly, the use of nonce generation and verification functions without passing the $action parameter is insecure. Lines 114 and 123 should be edited to add the use of an action. Note that this mistake would be caught when developing with WP_DEBUG enabled as this use of check_admin_referer() raises a notice.
+
+The second mistake is more subtle. On line 137 the following check is made:
+
+1
+2
+if (isset($_REQUEST['nonce']) && ! wp_verify_nonce($_REQUEST['nonce'], 'dvp_settings'))
+    // ... failed nonce check
+
+The problem with this check is that it requires the nonce request parameter to be set to ever evaluate to true. This means that an attacker can simply omit this parameter to bypass the nonce verification. This type of logic error means that it is highly recommended that you use check_admin_referer() instead of wp_verify_nonce() directly.
+
+Missing capabilities checks
+
+The lack of capabilities checks in the log deletion handler allows for a privilege escalation attack. Any logged in user is able to delete rows from the login_audit table since there are no privilege checks. Note that unauthenticated users cannot exploit this because the handler is not hooked into a _nopriv admin-post.php action. However, this is still a serious security failure. So, always remember to use the appropriate current_user_can() capabilities checks on your admin pages and privileged request handlers.
+
+Failure to exit after a redirect
+
+When a script redirects the user to another page execution will actually continue on the server side until it exits. This means that it is almost always desirable to make a call to exit or die() when making a redirect. The failure to do this on line 140 means that the capabilities check and CSRF defence (even if it didn’t have a logic error) are rendered useless as a forged request or request made by a low privilege user will actually cause the settings to be updated even though the conditional triggered a redirect. (Note that using check_admin_referer() would have also nullified the problem for a forged request since it calls die() on failure.) The other locations where redirects are used are not vulnerable in the same way because they are called at the end of script execution, but it would be good practice to add exits there as well.
+
+This vulnerability is exacerbated by the fact that the plugin has a ridiculous update loop that would allow a successful attacker to update any option in the database. Instead a plugin should know which options it is in charge of and only modify those whitelisted options.
+
+Open redirect
+
+On a redirect related note, there is an open redirect vulnerability in the deletion handler on line 130. In this plugin the intention is to return the user to the list of failed login attempts, so wp_safe_redirect() should have been used instead of plain old wp_redirect(). However, in this situation it would be even better to redirect to a hardcoded URL using menu_page_url() or admin_url() and then remove the ability to specify the redirect through the request parameters.
+
+IP forgery
+
+The dvp_get_ip() function can be tricked into logging an incorrect IP address since the X-Forwarded-For header is user controllable. This is bad news for a variety of reasons. For security logging purposes it degrades the utility of the audit trail as an attacker pretends to be coming from a legitimate address. If it were used for securing access then it is trivially by-passable. In the case of this plugin this can also lead to SQL injection and persistent XSS.
+
+Conclusion
+
+There are many things that plugin authors can do wrong! The number one rule to remember is that the user is not to be trusted. Always validate and escape anything that could be controlled by a user.
+
+I hope that participants found this to be a useful exercise and that this review post has helped your understanding of plugin security.
