@@ -1,5 +1,0 @@
-        # Blocking wp-json
-        location ~ /wp-json/ {
-                deny all;
-                return 444;
-        }

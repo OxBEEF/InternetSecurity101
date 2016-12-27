@@ -1,4 +1,0 @@
-# REQUEST METHODS FILTERED
-RewriteEngine On
-RewriteCond %{REQUEST_METHOD} ^(HEAD|TRACE|DELETE|TRACK|DEBUG|PUT) [NC]
-RewriteRule ^(.*)$ index.php [L]
